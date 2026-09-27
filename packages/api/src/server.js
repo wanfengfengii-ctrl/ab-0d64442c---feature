@@ -1,5 +1,11 @@
 import express from 'express';
-import { solve, LIMITS, ValidationError, SearchBudgetError } from '@chart/solver';
+import {
+  solve,
+  solveWithIsolation,
+  LIMITS,
+  ValidationError,
+  SearchBudgetError,
+} from '@chart/solver';
 
 export function createApp() {
   const app = express();
@@ -25,13 +31,27 @@ export function createApp() {
       maxAbsX: LIMITS.maxAbsX,
       maxMissingPerGap: LIMITS.maxGap,
       maxTolerance: LIMITS.maxTolerance,
+      isolation: {
+        type: 'boolean',
+        description:
+          '可选；true 时启用隔离复核，允许暂不采信恰一条可能受潮变形的残迹。未启用时裁决与输出保持常规复原原状。',
+      },
     });
   });
 
   app.post('/api/restore', (req, res) => {
     try {
-      const result = solve(req.body);
+      // Isolation review is strictly opt-in; without the flag the ordinary
+      // verdict and response shape are preserved exactly.
+      const isolation = req.body?.isolation === true;
+      const result = isolation ? solveWithIsolation(req.body) : solve(req.body);
       if (result.ok) return res.json(result);
+      if (isolation) {
+        // Valid isolation-review verdicts that withhold no trace: ordinary
+        // restoration already succeeds, or no single contaminant is provable.
+        // The body states the first blocking basis explicitly.
+        return res.json(result);
+      }
       // No common grid spacing satisfies the tolerance: report the first
       // failing trace and its neighbouring determined index interval.
       return res.status(422).json(result);

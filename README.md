@@ -130,6 +130,62 @@ npm run smoke            # 对本地运行的 API 执行与 verify 相同的冒�
 
 其他：`GET /api/health`（健康检查）、`GET /api/schema`（输入约束）。
 
+## 隔离复核（可选，`"isolation": true`）
+
+当常规复原无法让全部残迹共享同一经线网时，修复师可显式启用**隔离复核**：联合决定
+
+- 被暂不采信的**恰一条**可能受潮变形的残迹；
+- 其余残迹的严格递增序号、共同网距与起始位置；
+- 相邻缺线数上限**跨越被隔离位置连续成立**（被隔离残迹两侧的保留残迹之间，
+  合并步长取自原始两段上限之和；被隔离残迹可以是占有序号槽位的错放残迹，
+  也可以是两侧保留残迹恰为相邻经线时的多余标记）。
+
+**未启用时**（省略或 `false`），既有录入、响应结构与裁决结果完全保持原状
+（仍是 `200` / `422` 那套输出）。该复核不是先删除局部异常值再沿用原求解结论：
+每个候选隔离对象都对其余残迹重新执行完整的三级联合裁决。
+
+候选方案先按**保留残迹**的既有最大偏差、偏差平方和、缺线数序列裁决；仍并列时
+取被隔离残迹与该网格**可达序号位置**的最小偏差**更大**者，再按录入序号稳定选择。
+
+成功 `200`（在常规结果字段之外额外给出）：
+
+```json
+{
+  "ok": true,
+  "isolated": true,
+  "spacing": 10,
+  "start": 10,
+  "retainedIndices": [1, 2, 3, 5, 6],
+  "items": [ /* 仅含保留残迹，position 仍为原录入序号 */ ],
+  "gapsFilled": [0, 0, null, null, 0],
+  "isolatedTrace": {
+    "position": 4,
+    "x": 47,
+    "reachableIndexRange": [4, 10],
+    "hasOwnMeridianSlot": true,
+    "nearestFittedIndex": 4,
+    "nearestFittedPosition": 40,
+    "nearestDeviation": 7,
+    "tolerance": 0.5,
+    "evidence": "……偏差为 7，超过容差 0.5，故可证明其不属于该经线网……"
+  },
+  "alternativesConsidered": 1
+}
+```
+
+- 跨越隔离位置的两个原始缺线段不可单独观测，`gapsFilled` 中记为 `null`；
+- 多余标记（无序号槽位）时 `reachableIndexRange` 为 `null`、
+  `hasOwnMeridianSlot` 为 `false`，证据改以两侧相邻经线衡量。
+
+不能隔离时返回 `200` 且 `ok:false`，并给出**不能隔离的首项依据**，绝不展示
+貌似成功的复原：
+
+- `ISOLATION_NOT_NEEDED`：常规复原本身已可行；
+- `NO_ISOLATABLE_TRACE` / `RETAINED_SET_INFEASIBLE`：无论隔离哪一条，其余残迹
+  仍无容差内共同网距（附 `firstBlockingTrace` 与其保留集最小最大偏差）；
+- `NO_ISOLATABLE_TRACE` / `WITHHELD_TRACE_NOT_PROVEN_OUTSIDE`：候选残迹在容差内
+  仍能落入可达经线位置，无法证明其为污染残迹。
+
 ## 求解方法（为什么不是逐段就近取整）
 
 对候选整数步长向量 `g`（`g_j = 缺线数 + 1`，序号前缀和 `P`），拟合 `x_i ≈ s + d·P_i`：

@@ -136,6 +136,75 @@ await check('复原 API 冒烟：参数校验', async () => {
   assert(body.ok === false && Array.isArray(body.errors) && body.errors.length > 0, '缺少 errors');
 });
 
+// --- 隔离复核 (isolation review) ---
+
+await check('隔离复核：未启用时裁决与原状完全一致（422 诊断）', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [0, 10, 11, 20, 30],
+    maxGaps: [0, 0, 0, 0],
+    tolerance: 0.4,
+  });
+  assert(status === 422, `HTTP ${status}`);
+  assert(body.ok === false && body.code === 'NO_COMMON_SPACING', `code=${body.code}`);
+  assert(body.firstFailingTrace === 3, `firstFailingTrace=${body.firstFailingTrace}`);
+});
+
+await check('隔离复核：常规复原已可行时明确返回无需隔离', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [10, 30, 50, 80, 100],
+    maxGaps: [3, 3, 3, 3],
+    tolerance: 0,
+    isolation: true,
+  });
+  assert(status === 200, `HTTP ${status}`);
+  assert(body.ok === false && body.code === 'ISOLATION_NOT_NEEDED', `code=${body.code}`);
+});
+
+await check('隔离复核：恰一条污染残迹被隔离并给出证据', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [10, 20, 30, 47, 50, 60],
+    maxGaps: [2, 2, 2, 2, 2],
+    tolerance: 0.5,
+    isolation: true,
+  });
+  assert(status === 200, `HTTP ${status}`);
+  assert(body.ok === true && body.isolated === true, '应返回隔离成功');
+  assert(body.isolatedTrace.position === 4, `position=${body.isolatedTrace?.position}`);
+  assert(body.isolatedTrace.x === 47, '应回传被隔离残迹原坐标');
+  assert(
+    JSON.stringify(body.isolatedTrace.reachableIndexRange) === JSON.stringify([4, 10]),
+    `range=${JSON.stringify(body.isolatedTrace.reachableIndexRange)}`,
+  );
+  assert(Math.abs(body.isolatedTrace.nearestDeviation - 7) < 1e-9, 'nearestDeviation');
+  assert(body.isolatedTrace.nearestDeviation > body.isolatedTrace.tolerance, '证据须超容差');
+  assert(typeof body.isolatedTrace.evidence === 'string' && body.isolatedTrace.evidence.length > 0, '缺少证据文本');
+  assert(body.maxDeviation <= 0.5 + 1e-9, '保留残迹须在容差内');
+  assert(body.items.length === 5, 'items 只含保留残迹');
+  // 跨越隔离位置的缺线上限连续成立：跨位两段在结果中标记为不可判定
+  assert(
+    JSON.stringify(body.gapsFilled) === JSON.stringify([0, 0, null, null, 0]),
+    `gapsFilled=${JSON.stringify(body.gapsFilled)}`,
+  );
+});
+
+await check('隔离复核：无单条污染残迹时明确返回不能隔离的首项依据', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [0, 10, 11, 20, 21],
+    maxGaps: [0, 0, 0, 0],
+    tolerance: 0.4,
+    isolation: true,
+  });
+  assert(status === 200, `HTTP ${status}`);
+  assert(body.ok === false, '不得展示貌似成功的复原');
+  assert(body.code === 'NO_ISOLATABLE_TRACE', `code=${body.code}`);
+  assert(
+    body.reason === 'RETAINED_SET_INFEASIBLE' || body.reason === 'WITHHELD_TRACE_NOT_PROVEN_OUTSIDE',
+    `reason=${body.reason}`,
+  );
+  assert(Number.isInteger(body.firstBlockingTrace), '须给出首项依据所涉残迹');
+  assert(typeof body.message === 'string' && body.message.length > 0, '须有明确说明');
+});
+
 if (WEB) {
   await check('Web 页面可访问', async () => {
     const resp = await fetch(`${WEB}/`);
@@ -152,6 +221,18 @@ if (WEB) {
     });
     assert(status === 200 && body.ok === true, `HTTP ${status}`);
     assert(Math.abs(body.spacing - 10) < 1e-9, `spacing=${body.spacing}`);
+  });
+
+  await check('经 Web 反代调用隔离复核 API', async () => {
+    const { status, body } = await postJSON(`${WEB}/api/restore`, {
+      x: [10, 20, 30, 47, 50, 60],
+      maxGaps: [2, 2, 2, 2, 2],
+      tolerance: 0.5,
+      isolation: true,
+    });
+    assert(status === 200 && body.ok === true && body.isolated === true, `HTTP ${status}`);
+    assert(body.isolatedTrace.position === 4, '隔离残迹序号不符');
+    assert(body.isolatedTrace.nearestDeviation > body.isolatedTrace.tolerance, '证据须超容差');
   });
 }
 

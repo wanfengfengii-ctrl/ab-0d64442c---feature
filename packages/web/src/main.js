@@ -10,12 +10,16 @@ const restoreBtn = document.querySelector('#restore');
 const sampleBtn = document.querySelector('#fill-sample');
 const clearBtn = document.querySelector('#clear-all');
 const tolInput = document.querySelector('#tolerance');
+const isolationInput = document.querySelector('#isolation');
 const errList = document.querySelector('#input-errors');
 const resultPanel = document.querySelector('#result-panel');
 const failurePanel = document.querySelector('#failure-panel');
+const blockedPanel = document.querySelector('#isolation-blocked-panel');
+const isolationBanner = document.querySelector('#isolation-banner');
 const resultStats = document.querySelector('#result-stats');
 const resultTbody = document.querySelector('#result-tbody');
 const failureBody = document.querySelector('#failure-body');
+const blockedBody = document.querySelector('#isolation-blocked-body');
 
 function renderRows(count) {
   const had = tbody.querySelectorAll('tr').length;
@@ -83,7 +87,7 @@ function collectPayload() {
   if (!Number.isFinite(tolerance) || tolerance < 0) {
     errors.push('允许定位误差必须是非负数值');
   }
-  return { payload: { x, maxGaps, tolerance }, errors };
+  return { payload: { x, maxGaps, tolerance, isolation: isolationInput.checked }, errors };
 }
 
 function fmt(v, digits = 4) {
@@ -102,13 +106,38 @@ function showErrors(errors) {
 
 function showResult(r) {
   failurePanel.classList.add('hidden');
+  blockedPanel.classList.add('hidden');
   resultPanel.classList.remove('hidden');
+
+  if (r.isolated) {
+    const it = r.isolatedTrace;
+    const range = it.reachableIndexRange
+      ? `${it.reachableIndexRange[0]} – ${it.reachableIndexRange[1]}`
+      : '无（两侧保留残迹为相邻经线）';
+    isolationBanner.classList.remove('hidden');
+    isolationBanner.innerHTML = `
+      <strong>隔离复核结果：暂不采信第 ${it.position} 条残迹</strong>
+      <dl class="iso-evidence">
+        <dt>被隔离残迹</dt><dd>第 ${it.position} 条，原坐标 x=${it.x}</dd>
+        <dt>可达序号区间</dt><dd>${range}</dd>
+        <dt>最近拟合位置</dt>
+        <dd>序号 ${it.nearestFittedIndex}，拟合横坐标 ${fmt(it.nearestFittedPosition, 6)}，
+            偏差 ${fmt(it.nearestDeviation, 6)}（容差 ${fmt(it.tolerance, 6)}）</dd>
+        <dt>超出容差的证据</dt><dd>${it.evidence}</dd>
+        <dt>并列候选</dt><dd>共 ${r.alternativesConsidered} 条可证明污染的残迹，按联合裁决取本条</dd>
+      </dl>`;
+  } else {
+    isolationBanner.classList.add('hidden');
+    isolationBanner.replaceChildren();
+  }
+
   resultStats.innerHTML = `
     <div><dt>共同网距</dt><dd>${fmt(r.spacing, 6)}</dd></div>
     <div><dt>起始位置（序号 1）</dt><dd>${fmt(r.start, 6)}</dd></div>
-    <div><dt>最大偏差</dt><dd>${fmt(r.maxDeviation, 6)}</dd></div>
-    <div><dt>偏差平方和</dt><dd>${fmt(r.squaredDeviations, 6)}</dd></div>`;
+    <div><dt>最大偏差${r.isolated ? '（保留残迹）' : ''}</dt><dd>${fmt(r.maxDeviation, 6)}</dd></div>
+    <div><dt>偏差平方和${r.isolated ? '（保留残迹）' : ''}</dt><dd>${fmt(r.squaredDeviations, 6)}</dd></div>`;
   resultTbody.replaceChildren();
+  const rowByPosition = new Map();
   r.items.forEach((it) => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -117,10 +146,27 @@ function showResult(r) {
       <td>${it.index}</td>
       <td>${fmt(it.fitted, 6)}</td>
       <td class="${Math.abs(it.deviation) > 1e-9 ? 'dev' : 'zero'}">${fmt(it.deviation, 6)}</td>`;
-    resultTbody.appendChild(tr);
+    rowByPosition.set(it.position, tr);
   });
+  if (r.isolated) {
+    const it = r.isolatedTrace;
+    const tr = document.createElement('tr');
+    tr.className = 'isolated-row';
+    tr.innerHTML = `
+      <td>${it.position}</td>
+      <td>${it.x}</td>
+      <td colspan="3">已隔离（不参与共同网距裁决）；最近可达序号 ${it.nearestFittedIndex}，
+        距最近拟合位置偏差 ${fmt(it.nearestDeviation, 6)} &gt; 容差 ${fmt(it.tolerance, 6)}</td>`;
+    rowByPosition.set(it.position, tr);
+  }
+  for (const pos of [...rowByPosition.keys()].sort((a, b) => a - b)) {
+    resultTbody.appendChild(rowByPosition.get(pos));
+  }
   // Render the per-gap fill counts as an annotated row beneath the table.
-  const gaps = r.gapsFilled.map((g, j) => `${j + 1}→${j + 2}: ${g}`).join('　');
+  // Gaps adjacent to the isolated trace are not jointly observable (null).
+  const gaps = r.gapsFilled
+    .map((g, j) => `${j + 1}→${j + 2}: ${g === null || g === undefined ? '不可判定（跨隔离位置）' : g}`)
+    .join('　');
   let note = resultPanel.querySelector('.gaps-note');
   if (!note) {
     note = document.createElement('p');
@@ -132,6 +178,7 @@ function showResult(r) {
 
 function showFailure(r) {
   resultPanel.classList.add('hidden');
+  blockedPanel.classList.add('hidden');
   failurePanel.classList.remove('hidden');
   const [a, b] = r.previousIndexRange;
   const [c, d] = r.allowedIndexRange;
@@ -149,10 +196,40 @@ function showFailure(r) {
     </dl>`;
 }
 
+function showIsolationBlocked(r) {
+  resultPanel.classList.add('hidden');
+  failurePanel.classList.add('hidden');
+  blockedPanel.classList.remove('hidden');
+  blockedPanel.querySelector('h2').textContent =
+    r.code === 'ISOLATION_NOT_NEEDED' ? '无需隔离复核' : '隔离复核不能成立';
+  blockedBody.innerHTML = `
+    <p class="failure-msg">${r.message}</p>
+    <dl class="diag">
+      <dt>裁决码</dt><dd>${r.code}${r.reason ? `（${r.reason}）` : ''}</dd>
+      ${
+        r.firstBlockingTrace
+          ? `<dt>首项依据所涉残迹</dt><dd>第 ${r.firstBlockingTrace} 条（按录入顺序）</dd>`
+          : ''
+      }
+      ${
+        r.firstBlockingRetainedMaxDeviation != null
+          ? `<dt>隔离该残迹后保留残迹的最小最大偏差</dt>
+             <dd>${fmt(r.firstBlockingRetainedMaxDeviation, 6)}（仍超过容差）</dd>`
+          : ''
+      }
+    </dl>
+    ${
+      r.code === 'ISOLATION_NOT_NEEDED'
+        ? '<p class="note">请在不勾选隔离复核的情况下查看常规复原结果。</p>'
+        : '<p class="note">系统不会展示貌似成功的复原：仅当恰有一条残迹可被证明确实不属于该网格时才输出隔离结果。</p>'
+    }`;
+}
+
 async function restore() {
   showErrors([]);
   resultPanel.classList.add('hidden');
   failurePanel.classList.add('hidden');
+  blockedPanel.classList.add('hidden');
   const { payload, errors } = collectPayload();
   if (errors.length) {
     showErrors(errors);
@@ -168,7 +245,9 @@ async function restore() {
     });
     const r = await resp.json();
     if (resp.ok && r.ok) showResult(r);
-    else if (resp.status === 422) showFailure(r);
+    else if (payload.isolation && (r.code === 'ISOLATION_NOT_NEEDED' || r.code === 'NO_ISOLATABLE_TRACE')) {
+      showIsolationBlocked(r);
+    } else if (resp.status === 422) showFailure(r);
     else if (r.errors) showErrors(r.errors);
     else showErrors([r.message || '复原失败']);
   } catch (e) {
@@ -185,9 +264,11 @@ restoreBtn.addEventListener('click', restore);
 clearBtn.addEventListener('click', () => {
   tbody.querySelectorAll('input').forEach((i) => (i.value = ''));
   tolInput.value = '2';
+  isolationInput.checked = false;
   showErrors([]);
   resultPanel.classList.add('hidden');
   failurePanel.classList.add('hidden');
+  blockedPanel.classList.add('hidden');
 });
 sampleBtn.addEventListener('click', () => {
   const x = [6, 45, 59, 110, 124, 188, 306, 331, 411, 476];
@@ -198,6 +279,22 @@ sampleBtn.addEventListener('click', () => {
     if (i < x.length - 1) tr.querySelector('.g-input').value = maxGaps[i];
   });
   tolInput.value = '2';
+  isolationInput.checked = false;
+});
+// Dedicated contaminated sample: traces sit on an exact spacing-10 grid except
+// the 4th (x=23 instead of 30); with no missing lines allowed the ordinary
+// restoration cannot share one web, while isolation review proves that trace
+// is an extra warped mark bracketed by adjacent meridians.
+document.querySelector('#fill-isolation-sample')?.addEventListener('click', () => {
+  const x = [0, 10, 20, 23, 30, 40];
+  const maxGaps = Array(5).fill(0);
+  renderRows(x.length);
+  [...tbody.querySelectorAll('tr')].forEach((tr, i) => {
+    tr.querySelector('.x-input').value = x[i];
+    if (i < x.length - 1) tr.querySelector('.g-input').value = maxGaps[i];
+  });
+  tolInput.value = '0.4';
+  isolationInput.checked = true;
 });
 
 renderRows(MIN_TRACES);

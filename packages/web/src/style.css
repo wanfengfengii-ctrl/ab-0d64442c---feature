@@ -161,6 +161,68 @@ button.primary:hover:not(:disabled) {
   font: inherit;
 }
 
+.checkbox-field {
+  align-items: flex-start;
+}
+
+.checkbox-field input[type='checkbox'] {
+  width: auto;
+  margin-top: 4px;
+  transform: scale(1.15);
+}
+
+.checkbox-field span {
+  font-weight: 400;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.isolation-banner {
+  border: 1px solid #b88a2e;
+  background: #fdf6e3;
+  border-radius: 8px;
+  padding: 10px 16px;
+  margin-bottom: 14px;
+  font-size: 14px;
+}
+
+.isolation-banner strong {
+  color: #8a611a;
+}
+
+.iso-evidence {
+  margin: 8px 0 0;
+}
+
+.iso-evidence dt {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.iso-evidence dd {
+  margin: 2px 0 0;
+}
+
+.isolated-row {
+  background: #fdf6e3;
+  font-style: italic;
+  color: #8a611a;
+}
+
+.isolated-row td:first-child {
+  text-align: center;
+}
+
+#isolation-blocked-panel {
+  border-color: #d8b88a;
+  background: #fdf8ee;
+}
+
+#isolation-blocked-panel .failure-msg {
+  color: #8a611a;
+}
+
 .errors {
   color: var(--danger);
   margin: 12px 0 0;

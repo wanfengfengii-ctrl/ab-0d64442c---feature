@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { solve, validatePayload, ValidationError } from '../index.js';
+import { solve, solveWithIsolation, validatePayload, ValidationError } from '../index.js';
 
 // ---------------------------------------------------------------------------
 // Independent reference implementations (dense bracket + golden-section on
@@ -48,19 +48,28 @@ function refMinimax(x, P) {
 }
 
 function refSse(x, P, R) {
+  return refFit(x, P, R).sse;
+}
+
+function refFit(x, P, R) {
   const n = x.length;
-  const sse = (d) => {
+  const clampS = (d) => {
+    const ys = x.map((xi, i) => xi - d * P[i]);
+    const maxY = Math.max(...ys);
+    const minY = Math.min(...ys);
+    const mean = ys.reduce((a, b) => a + b, 0) / n;
+    return Math.min(Math.max(mean, maxY - R), minY + R);
+  };
+  const sseAt = (d) => {
     const ys = x.map((xi, i) => xi - d * P[i]);
     const maxY = Math.max(...ys);
     const minY = Math.min(...ys);
     if (maxY - minY > 2 * R + 1e-9) return Infinity;
-    const mean = ys.reduce((a, b) => a + b, 0) / n;
-    const s = Math.min(Math.max(mean, maxY - R), minY + R);
+    const s = clampS(d);
     return ys.reduce((acc, y) => acc + (y - s) ** 2, 0);
   };
   const range = x[x.length - 1] - x[0];
   const dOpt = goldenMin((d) => refSpread(x, P, d), 1e-12, 2 * range + 1).d;
-  // feasible interval { spread(d) <= R } is an interval; bisect its ends
   let lo = 1e-12;
   let hi = dOpt;
   for (let i = 0; i < 200; i++) {
@@ -77,7 +86,11 @@ function refSse(x, P, R) {
     else hi = mid;
   }
   const dHi = lo;
-  return goldenMin(sse, dLo, dHi, 300).v;
+  const { d } = goldenMin(sseAt, dLo, dHi, 300);
+  const s = clampS(d);
+  const ys = x.map((xi, i) => xi - d * P[i]);
+  const sse = ys.reduce((acc, y) => acc + (y - s) ** 2, 0);
+  return { d, s, sse };
 }
 
 function* enumerateSteps(maxGaps, prefix = []) {
@@ -317,4 +330,311 @@ test('wide search space (10 traces, up to 100 missing per gap) stays fast', () =
   assert.ok(r.maxDeviation <= 1, `maxDev=${r.maxDeviation}`);
   assert.ok(r.spacing > 0);
   assert.ok(ms < 5000, `took ${ms}ms`);
+});
+
+// ---------------------------------------------------------------------------
+// 隔离复核 (isolation review)
+// ---------------------------------------------------------------------------
+
+// Independent brute-force isolation reference: enumerate retained step
+// vectors with explicit per-position bounds identical to the solver, compute
+// minimax + SSE fit with the golden-section reference, and adjudicate exactly
+// per the stated priority. Shares no code with the isolation solver.
+function* refRetainedSteps(maxGaps, k) {
+  const n = maxGaps.length + 1;
+  const m = n - 1;
+  function* gen(j, prefix) {
+    if (j === m - 1) {
+      yield prefix;
+      return;
+    }
+    let lo = 1;
+    let hi;
+    if (k > 0 && k < n - 1 && j === k - 1) {
+      hi = maxGaps[k - 1] + maxGaps[k] + 2; // merged span, h=1 = extra mark
+    } else if (j < k) {
+      hi = maxGaps[j] + 1;
+    } else {
+      hi = maxGaps[j + 1] + 1;
+    }
+    for (let g = lo; g <= hi; g++) yield* gen(j + 1, [...prefix, g]);
+  }
+  yield* gen(0, []);
+}
+
+function refIsolation(x, maxGaps, tol) {
+  const n = x.length;
+  const full = refSolve(x, maxGaps);
+  if (full.Rstar <= tol + 1e-9) return { notNeeded: true };
+  const cands = [];
+  for (let k = 0; k < n; k++) {
+    const rx = x.filter((_, i) => i !== k);
+    let Rstar = Infinity;
+    const rows = [];
+    for (const h of refRetainedSteps(maxGaps, k)) {
+      const P = prefixSums(h);
+      const R = refMinimax(rx, P);
+      rows.push({ h, P, R });
+      if (R < Rstar) Rstar = R;
+    }
+    if (!(Rstar <= tol + 1e-7)) {
+      cands.push({ k, feasible: false, retainedR: Rstar });
+      continue;
+    }
+    const rung = rows.filter((r) => r.R <= Rstar + 1e-7);
+    let best = null;
+    for (const r of rung) {
+      const fit = refFit(rx, r.P, Rstar);
+      if (!best || fit.sse < best.fit.sse - 1e-7) best = { ...r, fit };
+      // equal SSE: keep lexicographically smallest h (enumeration order)
+    }
+    const { d, s } = best.fit;
+    // nearest reachable grid position for the withheld trace
+    let nearestDev = Infinity;
+    let nearestIndex = null;
+    let anchorShift = 0;
+    let hasSlot = true;
+    let rangeLo = Infinity;
+    let rangeHi = -Infinity;
+    if (k === 0) {
+      for (const row of rows) {
+        if (row.R <= tol + 1e-7) {
+          rangeLo = 1;
+          rangeHi = 1;
+        }
+      }
+      for (let a = 1; a <= maxGaps[0] + 1; a++) {
+        const dev = Math.abs(x[k] - (s - a * d));
+        if (dev < nearestDev) {
+          nearestDev = dev;
+          anchorShift = a;
+        }
+      }
+      nearestIndex = 1;
+    } else if (k === n - 1) {
+      const left = best.P[best.P.length - 1] + 1;
+      for (const row of rows) {
+        if (row.R <= tol + 1e-7) {
+          const l = left; // left depends on row; recompute below
+        }
+      }
+      for (const row of rows) {
+        if (row.R > tol + 1e-7) continue;
+        const lRow = row.P[row.P.length - 1] + 2;
+        const hRow = row.P[row.P.length - 1] + 1 + maxGaps[n - 2] + 1;
+        if (lRow < rangeLo) rangeLo = lRow;
+        if (hRow > rangeHi) rangeHi = hRow;
+      }
+      for (let q = left + 1; q <= left + maxGaps[n - 2] + 1; q++) {
+        const dev = Math.abs(x[k] - (s + d * (q - 1)));
+        if (dev < nearestDev) {
+          nearestDev = dev;
+          nearestIndex = q;
+        }
+      }
+    } else {
+      const left = best.P[k - 1] + 1;
+      const right = best.P[k] + 1;
+      const lo = Math.max(left + 1, right - maxGaps[k] - 1);
+      const hi = Math.min(right - 1, left + maxGaps[k - 1] + 1);
+      for (const row of rows) {
+        if (row.R > tol + 1e-7) continue;
+        const lRow = row.P[k - 1] + 1;
+        const rRow = row.P[k] + 1;
+        const a = Math.max(lRow + 1, rRow - maxGaps[k] - 1);
+        const b = Math.min(rRow - 1, lRow + maxGaps[k - 1] + 1);
+        if (a <= b) {
+          if (a < rangeLo) rangeLo = a;
+          if (b > rangeHi) rangeHi = b;
+        }
+      }
+      if (lo <= hi) {
+        for (let q = lo; q <= hi; q++) {
+          const dev = Math.abs(x[k] - (s + d * (q - 1)));
+          if (dev < nearestDev) {
+            nearestDev = dev;
+            nearestIndex = q;
+          }
+        }
+      } else {
+        hasSlot = false;
+        for (const q of [left, right]) {
+          const dev = Math.abs(x[k] - (s + d * (q - 1)));
+          if (dev < nearestDev) {
+            nearestDev = dev;
+            nearestIndex = q;
+          }
+        }
+      }
+    }
+    cands.push({
+      k,
+      feasible: true,
+      R: Rstar,
+      sse: best.fit.sse,
+      h: best.h,
+      d,
+      s,
+      nearestDev,
+      nearestIndex,
+      anchorShift,
+      hasSlot,
+      range: rangeLo === Infinity ? null : [rangeLo, rangeHi],
+    });
+  }
+  const feasible = cands.filter((c) => c.feasible);
+  if (feasible.length === 0) return { blocked: 'RETAINED_SET_INFEASIBLE', firstBlockingTrace: cands[0].k + 1 };
+  const proven = feasible.filter((c) => c.nearestDev > tol + 1e-7);
+  if (proven.length === 0) {
+    return { blocked: 'WITHHELD_TRACE_NOT_PROVEN_OUTSIDE', firstBlockingTrace: feasible[0].k + 1 };
+  }
+  proven.sort((a, b) => {
+    if (Math.abs(a.R - b.R) > 1e-9) return a.R - b.R;
+    if (Math.abs(a.sse - b.sse) > 1e-6) return a.sse - b.sse;
+    for (let j = 0; j < a.h.length; j++) if (a.h[j] !== b.h[j]) return a.h[j] - b.h[j];
+    if (Math.abs(a.nearestDev - b.nearestDev) > 1e-9) return b.nearestDev - a.nearestDev;
+    return a.k - b.k;
+  });
+  return { winner: proven[0], provenCount: proven.length };
+}
+
+test('isolation review is opt-in and ordinary verdict is untouched', () => {
+  const payload = { x: [0, 10, 11, 20, 30], maxGaps: [0, 0, 0, 0], tolerance: 0.4 };
+  const r = solve(payload);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'NO_COMMON_SPACING');
+  assert.equal(r.firstFailingTrace, 3);
+  assert.equal(r.isolated, undefined);
+  assert.throws(
+    () => solve({ ...payload, isolation: 'yes' }),
+    ValidationError,
+  );
+  assert.deepEqual(
+    validatePayload({ x: [0, 10, 11, 20, 30], maxGaps: [0, 0, 0, 0], tolerance: 0.4, isolation: true }),
+    [],
+  );
+});
+
+test('isolation is refused when ordinary restoration already succeeds', () => {
+  const r = solveWithIsolation({ x: [10, 30, 50, 80, 100], maxGaps: [3, 3, 3, 3], tolerance: 0 });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'ISOLATION_NOT_NEEDED');
+});
+
+test('isolation withholds a warped trace that has its own meridian slot', () => {
+  const x = [10, 20, 30, 47, 50, 60];
+  const g = [2, 2, 2, 2, 2];
+  const r = solveWithIsolation({ x, maxGaps: g, tolerance: 0.5 });
+  assert.equal(r.ok, true);
+  assert.equal(r.isolated, true);
+  assert.equal(r.isolatedTrace.position, 4);
+  assert.equal(r.isolatedTrace.x, 47);
+  assert.equal(r.isolatedTrace.hasOwnMeridianSlot, true);
+  assert.deepEqual(r.isolatedTrace.reachableIndexRange, [4, 10]);
+  assert.equal(r.isolatedTrace.nearestFittedIndex, 4);
+  assert.ok(Math.abs(r.isolatedTrace.nearestDeviation - 7) < 1e-9);
+  assert.ok(r.isolatedTrace.nearestDeviation > 0.5);
+  assert.deepEqual(r.retainedIndices, [1, 2, 3, 5, 6]);
+  assert.deepEqual(r.gapsFilled, [0, 0, null, null, 0]);
+  assert.ok(r.maxDeviation < 1e-9);
+  // retained items carry original input positions
+  assert.deepEqual(r.items.map((it) => it.position), [1, 2, 3, 5, 6]);
+});
+
+test('isolation handles the first and the last record', () => {
+  const first = solveWithIsolation({ x: [3, 10, 20, 30, 40, 50], maxGaps: [2, 0, 0, 0, 0], tolerance: 0.4 });
+  assert.equal(first.ok, true);
+  assert.equal(first.isolatedTrace.position, 1);
+  assert.deepEqual(first.retainedIndices, [2, 3, 4, 5, 6]);
+  assert.ok(Math.abs(first.start - 0) < 1e-9);
+  assert.ok(first.isolatedTrace.nearestDeviation > 0.4);
+
+  const last = solveWithIsolation({ x: [0, 10, 20, 30, 40, 77], maxGaps: [0, 0, 0, 0, 3], tolerance: 0.4 });
+  assert.equal(last.ok, true);
+  assert.equal(last.isolatedTrace.position, 6);
+  assert.ok(last.isolatedTrace.nearestDeviation > 0.4);
+  assert.ok(last.isolatedTrace.nearestFittedIndex >= 6);
+});
+
+test('slotless withheld trace is treated as an extra mark', () => {
+  const r = solveWithIsolation({ x: [0, 10, 11, 20, 30, 40], maxGaps: [0, 0, 0, 0, 0], tolerance: 0.5 });
+  assert.equal(r.ok, true);
+  assert.equal(r.isolatedTrace.position, 3);
+  assert.equal(r.isolatedTrace.hasOwnMeridianSlot, false);
+  assert.equal(r.isolatedTrace.reachableIndexRange, null);
+  assert.ok(Math.abs(r.isolatedTrace.nearestDeviation - 1) < 1e-9);
+  // an extra mark within tolerance cannot be proven foreign
+  const soft = solveWithIsolation({ x: [0, 10, 11, 20, 30, 40], maxGaps: [0, 0, 0, 0, 0], tolerance: 1.5 });
+  assert.equal(soft.ok, false);
+  assert.equal(soft.code, 'NO_ISOLATABLE_TRACE');
+  assert.equal(soft.reason, 'WITHHELD_TRACE_NOT_PROVEN_OUTSIDE');
+});
+
+test('isolation is refused when no single trace is the pollutant', () => {
+  const r = solveWithIsolation({ x: [0, 10, 11, 20, 21], maxGaps: [0, 0, 0, 0], tolerance: 0.4 });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'NO_ISOLATABLE_TRACE');
+  assert.equal(r.reason, 'RETAINED_SET_INFEASIBLE');
+  assert.ok(r.message.includes('隔离复核无法成立'));
+  assert.equal(r.firstBlockingTrace, 1);
+  assert.ok(r.firstBlockingRetainedMaxDeviation > 0.4);
+});
+
+test('randomized isolation cross-check against brute-force reference', () => {
+  const rand = lcg(20260927);
+  let isolatedCount = 0;
+  let blockedCount = 0;
+  for (let iter = 0; iter < 200; iter++) {
+    const n = 5 + Math.floor(rand() * 3); // 5..7
+    const maxGaps = Array.from({ length: n - 1 }, () => Math.floor(rand() * 3)); // 0..2
+    let x = [Math.floor(rand() * 30)];
+    for (let i = 1; i < n; i++) x.push(x[i - 1] + 4 + Math.floor(rand() * 30));
+    const tol = 0.5 + rand() * 1.5;
+    const ordinary = solve({ x, maxGaps, tolerance: tol });
+    const want = refIsolation(x, maxGaps, tol);
+    const got = solveWithIsolation({ x, maxGaps, tolerance: tol });
+
+    if (ordinary.ok) {
+      assert.equal(want.notNeeded, true, `case ${iter}: reference confusion`);
+      assert.equal(got.code, 'ISOLATION_NOT_NEEDED', `case ${iter}: ${got.code}`);
+      continue;
+    }
+    if (want.blocked) {
+      blockedCount++;
+      assert.equal(got.ok, false, `case ${iter}: expected block`);
+      assert.equal(got.code, 'NO_ISOLATABLE_TRACE', `case ${iter}`);
+      assert.equal(got.reason, want.blocked, `case ${iter}`);
+      continue;
+    }
+    isolatedCount++;
+    assert.equal(got.ok, true, `case ${iter}: expected isolation (${JSON.stringify(want.winner)})`);
+    const w = want.winner;
+    assert.equal(got.isolatedTrace.position, w.k + 1, `case ${iter}: winner`);
+    assert.ok(Math.abs(got.maxDeviation - w.R) < 1e-6, `case ${iter}: R ${got.maxDeviation} vs ${w.R}`);
+    assert.ok(Math.abs(got.squaredDeviations - w.sse) < 1e-4, `case ${iter}: sse`);
+    assert.ok(
+      Math.abs(got.isolatedTrace.nearestDeviation - w.nearestDev) < 1e-6,
+      `case ${iter}: nearestDev ${got.isolatedTrace.nearestDeviation} vs ${w.nearestDev}`,
+    );
+    if (w.range === null) assert.equal(got.isolatedTrace.reachableIndexRange, null, `case ${iter}: range null`);
+    else assert.deepEqual(got.isolatedTrace.reachableIndexRange, w.range, `case ${iter}: range`);
+    assert.equal(got.alternativesConsidered, want.provenCount, `case ${iter}: alt count`);
+    // retained gap bounds hold and gapsFilled null pattern is right
+    const k = w.k;
+    const keptOrig = [];
+    for (let j = 0; j < n - 1; j++) {
+      if (!(j === k - 1 || j === k)) keptOrig.push(j);
+    }
+    let rg = 0;
+    got.gapsFilled.forEach((g, j) => {
+      if (j === k - 1 || j === k) {
+        assert.equal(g, null, `case ${iter}: gap ${j} should be null`);
+      } else {
+        const origBound = maxGaps[keptOrig[rg++]];
+        assert.ok(g >= 0 && g <= origBound, `case ${iter}: gap ${j} = ${g} bound ${origBound}`);
+      }
+    });
+  }
+  assert.ok(isolatedCount > 10, `too few isolated cases: ${isolatedCount}`);
+  assert.ok(blockedCount > 0, `expected some blocked cases`);
 });
