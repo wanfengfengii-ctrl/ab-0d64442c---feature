@@ -1,0 +1,68 @@
+name: chart-meridian
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: packages/api/Dockerfile
+    image: chart-meridian-api
+    environment:
+      PORT: 3000
+    ports:
+      - "${API_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - chartnet
+
+  web:
+    build:
+      context: .
+      dockerfile: packages/web/Dockerfile
+    image: chart-meridian-web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - chartnet
+
+  # One-shot verification: runs after api and web are healthy, executes solver
+  # unit tests + frontend build + restore-API smoke, and reports via exit code.
+  #   docker compose up --build --exit-code-from=verify verify
+  verify:
+    build:
+      context: .
+      dockerfile: verify/Dockerfile
+    image: chart-meridian-verify
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://api:3000
+      WEB_BASE_URL: http://web
+    networks:
+      - chartnet
+
+networks:
+  chartnet:
+    driver: bridge

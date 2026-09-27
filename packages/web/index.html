@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>海图经线网复原</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <h1>海图经线网复原</h1>
+      <p>
+        录入受潮航海图上 5–10 条经线残迹的整数横坐标、相邻残迹间可能缺失的经线数上限与允许定位误差，
+        系统对全部残迹作全局裁决：联合确定严格递增的整数经线序号、正的共同网距与起始位置，
+        依次使最大偏差最小、偏差平方和最小、相邻缺线数序列字典序最小。
+      </p>
+    </header>
+
+    <main>
+      <section class="panel" aria-labelledby="input-title">
+        <h2 id="input-title">残迹录入</h2>
+        <table class="trace-table" id="trace-table">
+          <thead>
+            <tr>
+              <th>残迹</th>
+              <th>横坐标 x（整数）</th>
+              <th>与下一条间最多缺线数</th>
+            </tr>
+          </thead>
+          <tbody id="trace-tbody"></tbody>
+        </table>
+        <div class="row-actions">
+          <button type="button" id="add-trace">＋ 添加残迹</button>
+          <button type="button" id="remove-trace">－ 删除末行</button>
+        </div>
+        <label class="field">
+          <span>允许定位误差</span>
+          <input id="tolerance" type="number" min="0" step="any" value="2" />
+        </label>
+        <div class="row-actions">
+          <button type="button" id="restore" class="primary">复原</button>
+          <button type="button" id="fill-sample">填入示例</button>
+          <button type="button" id="clear-all">清空</button>
+        </div>
+        <ul class="errors" id="input-errors"></ul>
+      </section>
+
+      <section class="panel hidden" id="result-panel" aria-labelledby="result-title">
+        <h2 id="result-title">复原结果</h2>
+        <div class="stats" id="result-stats"></div>
+        <table class="result-table">
+          <thead>
+            <tr>
+              <th>残迹</th>
+              <th>录入横坐标</th>
+              <th>经线序号</th>
+              <th>拟合位置</th>
+              <th>偏差</th>
+            </tr>
+          </thead>
+          <tbody id="result-tbody"></tbody>
+        </table>
+        <p class="note">序号以首条残迹为 1 起排；偏差 = 录入横坐标 − 拟合位置。</p>
+      </section>
+
+      <section class="panel hidden" id="failure-panel" aria-labelledby="failure-title">
+        <h2 id="failure-title">无法复原</h2>
+        <div id="failure-body"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

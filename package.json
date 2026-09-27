@@ -1,0 +1,13 @@
+{
+  "name": "chart-meridian-restorer",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "npm run test -w @chart/solver",
+    "build": "npm run build -w @chart/web",
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
