@@ -1,4 +1,4 @@
-import { Fr, fr0, fr2 } from './fraction.js';
+import { Fr, fr0, fr1, fr2 } from './fraction.js';
 
 export class ValidationError extends Error {
   constructor(errors) {
@@ -397,15 +397,11 @@ function diagnose(x, maxGaps, tolFr, budget) {
 
 // ---------------------------------------------------------------------------
 
-export function solve(raw) {
-  const errors = validatePayload(raw);
-  if (errors.length > 0) throw new ValidationError(errors);
-
-  const x = raw.x;
-  const maxGaps = raw.maxGaps;
+// Core global adjudication over a validated trace set. Returns the public
+// result object plus exact rational internals under `_exact` (stripped by
+// publicView before leaving the module).
+function solveCore(x, maxGaps, tolFr, budget) {
   const n = x.length;
-  const tolFr = toFraction(raw.tolerance);
-  const budget = { count: 0, limit: DFS_BUDGET };
 
   // Phase 1 — binary-search the minimax level with the double oracle.
   let lo = 0;
@@ -482,5 +478,214 @@ export function solve(raw) {
       deviation: deviations[i].toNumber(),
     })),
     gapsFilled: best.steps.map((g) => g - 1),
+    _exact: { d, s, maxDeviation: maxDev, sse },
+  };
+}
+
+function publicView(result) {
+  const { _exact, ...pub } = result;
+  return pub;
+}
+
+export function solve(raw) {
+  const errors = validatePayload(raw);
+  if (errors.length > 0) throw new ValidationError(errors);
+  const budget = { count: 0, limit: DFS_BUDGET };
+  return publicView(solveCore(raw.x, raw.maxGaps, toFraction(raw.tolerance), budget));
+}
+
+// ---------------------------------------------------------------------------
+// Isolation review (隔离复核). When the full set admits no common grid, the
+// restorer may enable a review that distrusts exactly one possibly
+// moisture-deformed trace. Every candidate exclusion is re-solved from
+// scratch as a full global adjudication over the remaining traces — never by
+// deleting a local outlier and reusing the original verdict. The
+// missing-line limit straddling the isolated position is merged into
+// maxGaps[k-1] + maxGaps[k] + 1 (the isolated trace's own slot counts as one
+// more missing line), so the limit holds continuously across the isolated
+// position. Candidates are ranked by the kept traces' usual criteria (max
+// deviation, SSE, missing-line sequence), then by the larger minimum
+// deviation of the isolated trace to its reachable grid positions, then by
+// entry order. A candidate stands only if the isolated trace is provably
+// foreign to the fitted grid (its nearest reachable position lies beyond the
+// tolerance, or no reachable index exists at all).
+// ---------------------------------------------------------------------------
+
+// Gap limits for the remaining traces when trace k (0-based) is isolated.
+function keptGapLimits(maxGaps, k) {
+  const n = maxGaps.length + 1;
+  const kept = [];
+  for (let j = 0; j < n - 1; j++) {
+    if (j === k) continue; // gap right of the isolated trace is absorbed
+    if (j === k - 1) {
+      // Straddling limit: both original limits plus the isolated trace's slot.
+      if (k + 1 <= n - 1) kept.push(maxGaps[k - 1] + maxGaps[k] + 1);
+      continue; // isolating the last trace drops its left gap entirely
+    }
+    kept.push(maxGaps[j]);
+  }
+  return kept;
+}
+
+// Index interval the isolated trace could still occupy on the fitted grid,
+// given the kept traces' 1-based meridian indices and the original per-gap
+// missing-line limits. Empty (lo > hi) iff the neighbours of the isolated
+// position landed on consecutive meridians, leaving it no slot at all.
+function reachableIndexRange(k, n, maxGaps, keptIndices) {
+  if (k === 0) return [keptIndices[0] - maxGaps[0] - 1, keptIndices[0] - 1];
+  if (k === n - 1) {
+    const last = keptIndices[keptIndices.length - 1];
+    return [last + 1, last + maxGaps[n - 2] + 1];
+  }
+  const L = keptIndices[k - 1];
+  const R = keptIndices[k];
+  return [Math.max(L + 1, R - maxGaps[k] - 1), Math.min(R - 1, L + maxGaps[k - 1] + 1)];
+}
+
+// Minimise |xk - (s + d*(idx-1))| over integer indices idx in [lo, hi]
+// (exact rational arithmetic; the real minimizer is 1 + (xk - s)/d).
+function nearestGridPosition(xk, d, s, lo, hi) {
+  const t = new Fr(BigInt(xk)).sub(s).div(d).add(fr1);
+  const candidates = new Set([lo, hi]);
+  if (t.ge(new Fr(BigInt(lo))) && t.le(new Fr(BigInt(hi)))) {
+    const f = t.floor();
+    candidates.add(Number(f));
+    candidates.add(Number(f + 1n));
+  }
+  let best = null;
+  for (const idx of candidates) {
+    if (idx < lo || idx > hi) continue;
+    const fitted = s.add(d.mul(new Fr(BigInt(idx - 1))));
+    const dev = new Fr(BigInt(xk)).sub(fitted).abs();
+    if (!best || dev.lt(best.dev) || (dev.cmp(best.dev) === 0 && idx < best.index)) {
+      best = { index: idx, fitted, dev };
+    }
+  }
+  return best;
+}
+
+// Negative when a outranks b: kept traces' max deviation, then SSE, then the
+// missing-line sequence (all ascending, exactly as a plain restoration);
+// then the isolated trace's minimum reachable deviation, larger first (an
+// empty reachable interval counts as infinite — the strongest proof); then
+// entry order for stability.
+function compareIsolationCandidates(a, b) {
+  let c = a.res._exact.maxDeviation.cmp(b.res._exact.maxDeviation);
+  if (c !== 0) return c;
+  c = a.res._exact.sse.cmp(b.res._exact.sse);
+  if (c !== 0) return c;
+  const ga = a.res.gapsFilled;
+  const gb = b.res.gapsFilled;
+  for (let i = 0; i < ga.length; i++) {
+    if (ga[i] !== gb[i]) return ga[i] - gb[i];
+  }
+  if (a.minDevFr === null && b.minDevFr === null) return a.k - b.k;
+  if (a.minDevFr === null) return -1;
+  if (b.minDevFr === null) return 1;
+  c = b.minDevFr.cmp(a.minDevFr);
+  if (c !== 0) return c;
+  return a.k - b.k;
+}
+
+function describeBasis(basis) {
+  if (basis.reason === 'REMAINDER_INFEASIBLE') {
+    return (
+      `隔离第 ${basis.position} 条残迹后，其余残迹仍不存在满足误差约束的共同网距` +
+      `（第 ${basis.diagnosis.firstFailingTrace} 条残迹起无法纳入）`
+    );
+  }
+  const e = basis.evidence;
+  return (
+    `隔离第 ${basis.position} 条残迹后，其与网格可达序号位置的最小偏差 ` +
+    `${e.minDeviation} 未超过容差 ${e.tolerance}，无法证明其不属于该网格`
+  );
+}
+
+export function solveWithIsolation(raw) {
+  const errors = validatePayload(raw);
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && 'isolationReview' in raw) {
+    if (typeof raw.isolationReview !== 'boolean') {
+      errors.push('isolationReview 必须是布尔值（true 表示启用隔离复核）');
+    }
+  }
+  if (errors.length > 0) throw new ValidationError(errors);
+
+  const x = raw.x;
+  const maxGaps = raw.maxGaps;
+  const n = x.length;
+  const tolFr = toFraction(raw.tolerance);
+  const normal = solveCore(x, maxGaps, tolFr, { count: 0, limit: DFS_BUDGET });
+
+  // Feature off, or all traces already share one grid: the plain verdict
+  // stands untouched and no trace is distrusted.
+  if (raw.isolationReview !== true || normal.ok) return publicView(normal);
+
+  const candidates = [];
+  const bases = [];
+  for (let k = 0; k < n; k++) {
+    const keptX = x.filter((_, i) => i !== k);
+    const res = solveCore(keptX, keptGapLimits(maxGaps, k), tolFr, {
+      count: 0,
+      limit: DFS_BUDGET,
+    });
+    if (!res.ok) {
+      bases.push({
+        position: k + 1,
+        reason: 'REMAINDER_INFEASIBLE',
+        diagnosis: {
+          // Kept-set positions are mapped back to the original entry order.
+          firstFailingTrace:
+            res.firstFailingTrace <= k ? res.firstFailingTrace : res.firstFailingTrace + 1,
+          previousIndexRange: res.previousIndexRange,
+          allowedIndexRange: res.allowedIndexRange,
+          minAchievableMaxDeviation: res.minAchievableMaxDeviation,
+        },
+      });
+      continue;
+    }
+    const [lo, hi] = reachableIndexRange(k, n, maxGaps, res.indices);
+    const near = lo <= hi ? nearestGridPosition(x[k], res._exact.d, res._exact.s, lo, hi) : null;
+    const evidence = {
+      position: k + 1,
+      x: x[k],
+      reachableIndexRange: lo <= hi ? [lo, hi] : null,
+      nearestIndex: near ? near.index : null,
+      nearestFitted: near ? near.fitted.toNumber() : null,
+      minDeviation: near ? near.dev.toNumber() : null,
+      tolerance: raw.tolerance,
+      exceedsToleranceBy: near ? near.dev.sub(tolFr).toNumber() : null,
+    };
+    if (near && near.dev.le(tolFr)) {
+      // The trace could still sit on this grid within tolerance, so it cannot
+      // be proven foreign to the grid and must not be isolated on this basis.
+      bases.push({ position: k + 1, reason: 'TRACE_WITHIN_TOLERANCE', evidence });
+      continue;
+    }
+    candidates.push({ k, res, evidence, minDevFr: near ? near.dev : null });
+  }
+
+  if (candidates.length === 0) {
+    const first = bases[0];
+    return {
+      ok: false,
+      code: 'ISOLATION_IMPOSSIBLE',
+      message: `不存在可被证明确实不属于该网格的单条污染残迹：${describeBasis(first)}`,
+      firstBasis: first,
+    };
+  }
+
+  let best = candidates[0];
+  for (const c of candidates.slice(1)) {
+    if (compareIsolationCandidates(c, best) < 0) best = c;
+  }
+  const { k, res, evidence } = best;
+  const pub = publicView(res);
+  return {
+    ...pub,
+    items: pub.items.map((it) => ({
+      ...it,
+      position: it.position <= k ? it.position : it.position + 1,
+    })),
+    isolation: evidence,
   };
 }

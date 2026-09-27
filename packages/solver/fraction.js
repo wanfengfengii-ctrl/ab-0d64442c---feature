@@ -72,6 +72,11 @@ export class Fr {
   toNumber() {
     return Number(this.n) / Number(this.d);
   }
+  floor() {
+    let q = this.n / this.d;
+    if (this.n % this.d !== 0n && this.n < 0n) q -= 1n;
+    return q;
+  }
 }
 
 export const fr0 = new Fr(0n);

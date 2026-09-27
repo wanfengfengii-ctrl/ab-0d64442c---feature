@@ -136,6 +136,72 @@ await check('复原 API 冒烟：参数校验', async () => {
   assert(body.ok === false && Array.isArray(body.errors) && body.errors.length > 0, '缺少 errors');
 });
 
+await check('隔离复核：未启用时旧复原结果保持原状', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [10, 20, 35, 40, 50],
+    maxGaps: [0, 0, 0, 0],
+    tolerance: 1,
+  });
+  assert(status === 422, `HTTP ${status}`);
+  assert(body.ok === false && body.code === 'NO_COMMON_SPACING', `code=${body.code}`);
+  assert(!('isolation' in body), '未启用时不应出现隔离信息');
+});
+
+await check('隔离复核：单条受潮残迹隔离成功', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [10, 20, 35, 40, 50],
+    maxGaps: [0, 0, 0, 0],
+    tolerance: 1,
+    isolationReview: true,
+  });
+  assert(status === 200, `HTTP ${status}`);
+  assert(body.ok === true, 'body.ok !== true');
+  const iso = body.isolation;
+  assert(iso && iso.position === 3, `isolation=${JSON.stringify(iso)}`);
+  assert(iso.x === 35, `隔离残迹原坐标=${iso.x}`);
+  assert(
+    JSON.stringify(iso.reachableIndexRange) === JSON.stringify([3, 3]),
+    `reachableIndexRange=${JSON.stringify(iso.reachableIndexRange)}`,
+  );
+  assert(Math.abs(iso.nearestFitted - 30) < 1e-9, `nearestFitted=${iso.nearestFitted}`);
+  assert(Math.abs(iso.minDeviation - 5) < 1e-9, `minDeviation=${iso.minDeviation}`);
+  assert(iso.minDeviation > iso.tolerance, '缺少超出容差的证据');
+  assert(Math.abs(body.spacing - 10) < 1e-9, `spacing=${body.spacing}`);
+  assert(
+    JSON.stringify(body.indices) === JSON.stringify([1, 2, 4, 5]),
+    `indices=${JSON.stringify(body.indices)}`,
+  );
+  assert(
+    JSON.stringify(body.gapsFilled) === JSON.stringify([0, 1, 0]),
+    `gapsFilled=${JSON.stringify(body.gapsFilled)}`,
+  );
+  assert(
+    JSON.stringify(body.items.map((it) => it.position)) === JSON.stringify([1, 2, 4, 5]),
+    'items 未按录入序号列出保留残迹',
+  );
+});
+
+await check('隔离复核：无法证明单条污染时明确失败', async () => {
+  const { status, body } = await postJSON(`${API}/api/restore`, {
+    x: [10, 25, 35, 40, 50],
+    maxGaps: [0, 0, 0, 0],
+    tolerance: 1,
+    isolationReview: true,
+  });
+  assert(status === 422, `HTTP ${status}`);
+  assert(body.ok === false && body.code === 'ISOLATION_IMPOSSIBLE', `code=${body.code}`);
+  assert(!('items' in body) && !('isolation' in body), '不得展示貌似成功的复原');
+  assert(
+    body.firstBasis && body.firstBasis.position === 1,
+    `firstBasis=${JSON.stringify(body.firstBasis)}`,
+  );
+  assert(
+    body.firstBasis.reason === 'REMAINDER_INFEASIBLE',
+    `reason=${body.firstBasis.reason}`,
+  );
+  assert(body.firstBasis.diagnosis.firstFailingTrace >= 3, '首项依据缺少诊断');
+});
+
 if (WEB) {
   await check('Web 页面可访问', async () => {
     const resp = await fetch(`${WEB}/`);
@@ -152,6 +218,17 @@ if (WEB) {
     });
     assert(status === 200 && body.ok === true, `HTTP ${status}`);
     assert(Math.abs(body.spacing - 10) < 1e-9, `spacing=${body.spacing}`);
+  });
+
+  await check('经 Web 反代调用隔离复核', async () => {
+    const { status, body } = await postJSON(`${WEB}/api/restore`, {
+      x: [10, 20, 35, 40, 50],
+      maxGaps: [0, 0, 0, 0],
+      tolerance: 1,
+      isolationReview: true,
+    });
+    assert(status === 200 && body.ok === true, `HTTP ${status}`);
+    assert(body.isolation && body.isolation.position === 3, '反代链路隔离结果不符');
   });
 }
 

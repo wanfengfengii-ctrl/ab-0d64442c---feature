@@ -1,5 +1,5 @@
 import express from 'express';
-import { solve, LIMITS, ValidationError, SearchBudgetError } from '@chart/solver';
+import { solve, solveWithIsolation, LIMITS, ValidationError, SearchBudgetError } from '@chart/solver';
 
 export function createApp() {
   const app = express();
@@ -30,10 +30,16 @@ export function createApp() {
 
   app.post('/api/restore', (req, res) => {
     try {
-      const result = solve(req.body);
+      const body = req.body;
+      // Isolation review is opt-in: requests without the isolationReview key
+      // take the exact pre-existing code path and verdicts.
+      const review =
+        body && typeof body === 'object' && !Array.isArray(body) && 'isolationReview' in body;
+      const result = review ? solveWithIsolation(body) : solve(body);
       if (result.ok) return res.json(result);
-      // No common grid spacing satisfies the tolerance: report the first
-      // failing trace and its neighbouring determined index interval.
+      // 422 covers both NO_COMMON_SPACING (no common grid satisfies the
+      // tolerance) and ISOLATION_IMPOSSIBLE (no single provably foreign
+      // trace): the payload carries the diagnosis either way.
       return res.status(422).json(result);
     } catch (err) {
       if (err instanceof ValidationError) {

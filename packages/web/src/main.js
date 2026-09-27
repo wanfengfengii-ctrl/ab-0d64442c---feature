@@ -10,9 +10,12 @@ const restoreBtn = document.querySelector('#restore');
 const sampleBtn = document.querySelector('#fill-sample');
 const clearBtn = document.querySelector('#clear-all');
 const tolInput = document.querySelector('#tolerance');
+const isoCheckbox = document.querySelector('#isolation-review');
 const errList = document.querySelector('#input-errors');
 const resultPanel = document.querySelector('#result-panel');
 const failurePanel = document.querySelector('#failure-panel');
+const resultTitle = document.querySelector('#result-title');
+const failureTitle = document.querySelector('#failure-title');
 const resultStats = document.querySelector('#result-stats');
 const resultTbody = document.querySelector('#result-tbody');
 const failureBody = document.querySelector('#failure-body');
@@ -83,7 +86,10 @@ function collectPayload() {
   if (!Number.isFinite(tolerance) || tolerance < 0) {
     errors.push('允许定位误差必须是非负数值');
   }
-  return { payload: { x, maxGaps, tolerance }, errors };
+  const payload = { x, maxGaps, tolerance };
+  // 仅在勾选时携带隔离复核开关，未启用时请求与既有录入完全一致。
+  if (isoCheckbox.checked) payload.isolationReview = true;
+  return { payload, errors };
 }
 
 function fmt(v, digits = 4) {
@@ -103,6 +109,29 @@ function showErrors(errors) {
 function showResult(r) {
   failurePanel.classList.add('hidden');
   resultPanel.classList.remove('hidden');
+  resultTitle.textContent = r.isolation ? '复原结果（隔离复核）' : '复原结果';
+  // Isolation banner: the distrusted trace and the evidence that it exceeds
+  // the tolerance on the restored grid.
+  let banner = resultPanel.querySelector('.isolation-banner');
+  if (r.isolation) {
+    const iso = r.isolation;
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.className = 'isolation-banner';
+      resultPanel.insertBefore(banner, resultStats);
+    }
+    const evidence =
+      iso.reachableIndexRange === null
+        ? `<dt>超出容差的证据</dt><dd>可达序号区间为空：该残迹在共同网格上不存在任何可落入的序号位置，必然超出容差 ${fmt(iso.tolerance, 6)}</dd>`
+        : `<dt>可达序号区间</dt><dd>${iso.reachableIndexRange[0]} – ${iso.reachableIndexRange[1]}</dd>
+           <dt>最近拟合位置</dt><dd>${fmt(iso.nearestFitted, 6)}（序号 ${iso.nearestIndex}）</dd>
+           <dt>超出容差的证据</dt><dd>最小偏差 ${fmt(iso.minDeviation, 6)} &gt; 容差 ${fmt(iso.tolerance, 6)}（超出 ${fmt(iso.exceedsToleranceBy, 6)}）</dd>`;
+    banner.innerHTML = `
+      <p><strong>暂不采信第 ${iso.position} 条残迹</strong>（录入横坐标 ${iso.x}），其余残迹共享同一经线网。</p>
+      <dl class="diag">${evidence}</dl>`;
+  } else if (banner) {
+    banner.remove();
+  }
   resultStats.innerHTML = `
     <div><dt>共同网距</dt><dd>${fmt(r.spacing, 6)}</dd></div>
     <div><dt>起始位置（序号 1）</dt><dd>${fmt(r.start, 6)}</dd></div>
@@ -120,7 +149,8 @@ function showResult(r) {
     resultTbody.appendChild(tr);
   });
   // Render the per-gap fill counts as an annotated row beneath the table.
-  const gaps = r.gapsFilled.map((g, j) => `${j + 1}→${j + 2}: ${g}`).join('　');
+  const pos = r.items.map((it) => it.position);
+  const gaps = r.gapsFilled.map((g, j) => `${pos[j]}→${pos[j + 1]}: ${g}`).join('　');
   let note = resultPanel.querySelector('.gaps-note');
   if (!note) {
     note = document.createElement('p');
@@ -133,6 +163,39 @@ function showResult(r) {
 function showFailure(r) {
   resultPanel.classList.add('hidden');
   failurePanel.classList.remove('hidden');
+  if (r.code === 'ISOLATION_IMPOSSIBLE') {
+    failureTitle.textContent = '隔离复核无法成立';
+    const b = r.firstBasis;
+    let detail;
+    if (b.reason === 'REMAINDER_INFEASIBLE') {
+      const d = b.diagnosis;
+      detail = `
+        <dt>不能隔离的首项依据</dt>
+        <dd>隔离第 ${b.position} 条残迹后，其余残迹仍不存在满足误差约束的共同网距</dd>
+        <dt>其中首个无法纳入同一经线网的残迹</dt>
+        <dd>第 ${d.firstFailingTrace} 条（按录入顺序）</dd>
+        <dt>相邻已定序号区间（前一条残迹可能的经线序号）</dt>
+        <dd>${d.previousIndexRange[0]} – ${d.previousIndexRange[1]}</dd>
+        <dt>该残迹依缺线上限可落入的序号区间</dt>
+        <dd>${d.allowedIndexRange[0]} – ${d.allowedIndexRange[1]}</dd>
+        <dt>理论可达的最小最大偏差</dt>
+        <dd>${fmt(d.minAchievableMaxDeviation, 6)}（超过限值）</dd>`;
+    } else {
+      const e = b.evidence;
+      detail = `
+        <dt>不能隔离的首项依据</dt>
+        <dd>隔离第 ${b.position} 条残迹（录入横坐标 ${e.x}）后，其与网格可达序号位置的最小偏差未超过容差，无法证明其不属于该网格</dd>
+        <dt>可达序号区间</dt>
+        <dd>${e.reachableIndexRange[0]} – ${e.reachableIndexRange[1]}</dd>
+        <dt>最近拟合位置</dt>
+        <dd>${fmt(e.nearestFitted, 6)}（序号 ${e.nearestIndex}）</dd>
+        <dt>最小偏差 / 容差</dt>
+        <dd>${fmt(e.minDeviation, 6)} ≤ ${fmt(e.tolerance, 6)}</dd>`;
+    }
+    failureBody.innerHTML = `<p class="failure-msg">${r.message}</p><dl class="diag">${detail}</dl>`;
+    return;
+  }
+  failureTitle.textContent = '无法复原';
   const [a, b] = r.previousIndexRange;
   const [c, d] = r.allowedIndexRange;
   failureBody.innerHTML = `
@@ -185,6 +248,7 @@ restoreBtn.addEventListener('click', restore);
 clearBtn.addEventListener('click', () => {
   tbody.querySelectorAll('input').forEach((i) => (i.value = ''));
   tolInput.value = '2';
+  isoCheckbox.checked = false;
   showErrors([]);
   resultPanel.classList.add('hidden');
   failurePanel.classList.add('hidden');

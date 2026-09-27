@@ -16,6 +16,35 @@
 **相邻已定序号区间**（前一条残迹在全体可行前缀拟合中可能的经线序号范围），以及该残迹
 依缺线上限可落入的序号区间和理论可达的最小最大偏差。
 
+## 隔离复核
+
+当常规复原无法让全部残迹共享同一经线网时，修复师可启用**隔离复核**（请求携带
+`"isolationReview": true`，或勾选页面复选框），允许暂不采信**恰一条**可能受潮变形的
+残迹。未启用时，既有录入、接口和裁决结果完全保持原状。
+
+系统联合决定被隔离的残迹、其余残迹的严格递增序号、共同网距与起始位置：
+
+- 每个候选位置都对其余残迹**从头做一次完整全局裁决**——不会先删除局部异常值再沿用
+  原求解结论；
+- 相邻缺线数上限**跨越被隔离位置连续成立**：被隔离残迹 k 两侧的原上限合并为
+  `maxGaps[k-1] + maxGaps[k] + 1`（被隔离残迹自身的序号位也计为一条缺线）；
+- 候选方案先按保留残迹的既有三级裁决（最大偏差 → 偏差平方和 → 缺线数序列），仍并列时
+  取**被隔离残迹与网格可达序号位置的最小偏差更大者**（可达区间为空视为无穷大，是
+  最强的污染证据），再按录入序号稳定选择；
+- 仅当被隔离残迹**可被证明确实不属于该网格**（可达序号区间为空，或区间上最近拟合位置
+  的偏差超过容差）时，隔离才成立。
+
+成功时响应在常规复原字段之外附带 `isolation`：被隔离残迹的录入序号 `position`、原坐标
+`x`、可达序号区间 `reachableIndexRange`（为空时为 `null`）、最近拟合位置
+`nearestFitted`（及其序号 `nearestIndex`）、最小偏差 `minDeviation`、容差 `tolerance`
+与超出量 `exceedsToleranceBy`；`items` 仅含保留残迹（`position` 仍为录入序号）。
+
+若不存在可被证明确实不属于该网格的单条污染残迹，接口返回 `422` +
+`code: "ISOLATION_IMPOSSIBLE"`，并在 `firstBasis` 中给出**不能隔离的首项依据**
+（按录入顺序首个候选的失败原因）：`REMAINDER_INFEASIBLE`（其余残迹仍不可复原，附诊断）
+或 `TRACE_WITHIN_TOLERANCE`（该残迹与网格可达位置的最小偏差未超容差，附证据），
+绝不展示貌似成功的复原。
+
 ## 目录结构
 
 ```
@@ -31,10 +60,10 @@
 │   │   ├── src/server.js       #   POST /api/restore、GET /api/health、GET /api/schema
 │   │   └── Dockerfile
 │   └── web/                    # Vite + 原生 JS 单页应用
-│       ├── index.html / src/   #   录入表单、结果表、缺线数与失败诊断展示
+│       ├── index.html / src/   #   录入表单、隔离复核开关、结果表、缺线数与失败诊断展示
 │       ├── nginx.conf          #   静态托管 + /api 反代
 │       └── Dockerfile          #   多阶段：vite build → nginx
-├── scripts/smoke.mjs           # verify 服务入口：测试 + 前端构建 + API 冒烟
+├── scripts/smoke.mjs           # verify 服务入口：测试 + 前端构建 + API 冒烟（含隔离复核）
 └── verify/Dockerfile           # 一次性验证镜像
 ```
 
@@ -54,8 +83,8 @@ WEB_PORT=9000 API_PORT=3100 docker compose up --build
 ## 一键验证（verify 一次性服务）
 
 `verify` 在 `api`、`web` 健康检查后启动，依次执行：求解器单元测试 → 前端构建 →
-复原 API 冒烟（精确网格 / 全局裁决 / 不可行诊断 / 参数校验 / Web 反代链路），
-并以**退出码**报告结果：
+复原 API 冒烟（精确网格 / 全局裁决 / 不可行诊断 / 参数校验 / 隔离复核成功与失败 /
+Web 反代链路），并以**退出码**报告结果：
 
 ```bash
 docker compose up --build --exit-code-from=verify verify
@@ -90,7 +119,9 @@ npm run smoke            # 对本地运行的 API 执行与 verify 相同的冒�
 
 - `x`：5–10 个严格递增的整数横坐标（±1e6 内）；
 - `maxGaps`：长度 = 残迹数 − 1，每段相邻残迹间可能缺失的经线数上限（0–100 整数）；
-- `tolerance`：允许定位误差（0–1e6 数值）。
+- `tolerance`：允许定位误差（0–1e6 数值）；
+- `isolationReview`（可选布尔）：`true` 时启用隔离复核（见上文）；缺省或 `false` 时
+  行为与既有版本完全一致。
 
 成功 `200`：
 
@@ -123,6 +154,56 @@ npm run smoke            # 对本地运行的 API 执行与 verify 相同的冒�
   "firstFailingTrace": 3,
   "previousIndexRange": [2, 2],
   "allowedIndexRange": [3, 3]
+}
+```
+
+隔离复核成功 `200`（`"isolationReview": true` 且常规复原失败时）：
+
+```json
+{
+  "ok": true,
+  "spacing": 10,
+  "start": 10,
+  "maxDeviation": 0,
+  "squaredDeviations": 0,
+  "indices": [1, 2, 4, 5],
+  "items": [
+    { "position": 1, "x": 10, "index": 1, "fitted": 10, "deviation": 0 },
+    { "position": 2, "x": 20, "index": 2, "fitted": 20, "deviation": 0 },
+    { "position": 4, "x": 40, "index": 4, "fitted": 40, "deviation": 0 },
+    { "position": 5, "x": 50, "index": 5, "fitted": 50, "deviation": 0 }
+  ],
+  "gapsFilled": [0, 1, 0],
+  "isolation": {
+    "position": 3,
+    "x": 35,
+    "reachableIndexRange": [3, 3],
+    "nearestIndex": 3,
+    "nearestFitted": 30,
+    "minDeviation": 5,
+    "tolerance": 1,
+    "exceedsToleranceBy": 4
+  }
+}
+```
+
+无法隔离 `422`：
+
+```json
+{
+  "ok": false,
+  "code": "ISOLATION_IMPOSSIBLE",
+  "message": "不存在可被证明确实不属于该网格的单条污染残迹：……",
+  "firstBasis": {
+    "position": 1,
+    "reason": "REMAINDER_INFEASIBLE",
+    "diagnosis": {
+      "firstFailingTrace": 4,
+      "previousIndexRange": [2, 2],
+      "allowedIndexRange": [3, 3],
+      "minAchievableMaxDeviation": 1.25
+    }
+  }
 }
 ```
 

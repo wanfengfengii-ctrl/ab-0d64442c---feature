@@ -36,6 +36,10 @@
           <span>允许定位误差</span>
           <input id="tolerance" type="number" min="0" step="any" value="2" />
         </label>
+        <label class="field checkbox">
+          <input type="checkbox" id="isolation-review" />
+          <span>隔离复核<small>（常规复原失败时，允许暂不采信恰一条可能受潮变形的残迹）</small></span>
+        </label>
         <div class="row-actions">
           <button type="button" id="restore" class="primary">复原</button>
           <button type="button" id="fill-sample">填入示例</button>
